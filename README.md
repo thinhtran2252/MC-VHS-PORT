@@ -1,160 +1,56 @@
-# LeviLauncher Android Mod Template
+# MC VHS PORT
 
-This is a CMake template for LeviLauncher Android native mods. It includes a
-ready-to-use `manifest.json`, CMake project, minimal `ClangeMeMod`, packaging script,
-typed config generation, and GitHub Actions workflow.
+Native Android / Minecraft Bedrock port of the screen-space post-processing ideas in the Java shader repository [`thinhtran2252/mcvhs`](https://github.com/thinhtran2252/mcvhs). This is an independent LeviLauncher mod. It does not reuse LeviPostFX code.
 
-## Project Layout
+## First port: single-pass screen effects
 
-```text
-.
-├── CMakeLists.txt
-├── manifest.json.in
-├── scripts/package.ps1
-└── src
-    ├── config_generator.cpp
-    ├── main.cpp
-    └── mod
-        ├── Config.h
-        ├── Config.cpp
-        ├── MyMod.cpp
-        └── MyMod.h
-```
+The current implementation hooks `eglSwapBuffers` through the public Preloader Android memory-hook API. On a current GLES context it copies the final default framebuffer to a texture, generates a mip chain, and draws a fullscreen GLES 3 pass back to the EGL surface.
 
-## Requirements
+Implemented first:
 
-- Android SDK
-- Android NDK 28.2.13676358 or a compatible version
-- CMake 3.22+
-- Ninja
-- PowerShell 7+, or Windows PowerShell
+- Lens distortion and the Java horizontal aspect-ratio crop
+- Time-based screen interlacing approximation
+- Static chroma noise and white-noise bursts
+- Auto exposure and manual exposure
+- Tonemapping methods: none, tanh, exponential / Beer, Reinhard
+- YUV, YIQ and YCbCr chroma compression controls
+- Extra zoom, side jitter and mip-based sharpening
+- Java-style `Default` and `DeepFried` profiles
 
-The CMake project fetches preloader-android release `0.2.2` from
-<https://github.com/LiteLDev/preloader-android> automatically.
+## Config and Mod Menu
 
-## Supported SDK Surface
+The native config is stored at `config/config.json`, with a generated `config.schema.json`. The config field IDs intentionally retain the Java shader option names where practical. The Levi Mod Menu exposes separate `Lens`, `Compression`, `Post Processing`, and `User Suggestions` modules, plus the master switch and profile selector.
 
-Use only public headers from the SDK `include` directory:
+The profile selector uses integer values because the public Levi Mod Menu config API exposes a numeric slider but does not expose a choice-list argument for its radio control in this SDK version:
 
-```cpp
-#include <pl/Mod.hpp>
-#include <pl/Config.hpp>
-#include <pl/ModMenu.hpp>
-#include <pl/Input.hpp>
-#include <pl/memory/Hook.hpp>
-#include <pl/memory/Patch.hpp>
-#include <pl/memory/Signature.hpp>
-```
+- `0`: Default
+- `1`: DeepFried
 
-Do not add preloader `src` directories to your include path. This template uses
-the current C++ API with `PL_REGISTER_MOD`.
+Changing the profile applies the corresponding values from `shaders.properties` for the effects currently ported. Other fields can then be edited individually and are saved to `config.json`.
+
+## Important limitations in this first pass
+
+- `eglSwapBuffers` sees the final composed screen. Effects therefore also affect HUD, menus, and other UI drawn into that framebuffer. This first implementation does not have a world-only render target.
+- Java interlacing scales its offset by camera displacement. The final EGL hook does not expose camera movement, so this port uses a time-varying scanline offset as an approximation.
+- Static noise is generated procedurally rather than sampling the Java pack's `4ChannelNoise.png` texture.
+- This is a combined single-pass port. Bloom's horizontal/vertical blur needs intermediate render targets and is intentionally not enabled yet.
+- SSR, world-space torch lighting, depth fog, water waves, and material passes need depth, normal, camera, or per-material data that this final-frame hook does not provide. They are not faked as if they were equivalent.
+- Mipmaps are generated from the captured screen each frame to support the Java shader's LOD-based exposure, compression, and sharpening. Their performance cost needs to be measured on-device.
+- The hook skips frames where a non-default framebuffer is still bound or the viewport dimensions are invalid. Device/game-specific framebuffer behavior still needs runtime testing.
 
 ## Build
 
+Requirements: Android SDK, Android NDK 28.2.13676358 (or compatible), CMake 3.22+, Ninja, and PowerShell 7+.
+
 ```powershell
 $env:ANDROID_HOME = "C:/Users/<you>/AppData/Local/Android/Sdk"
-
 ./scripts/package.ps1 -Abi arm64-v8a
 ```
 
-Build both Android architectures:
+For both supported ABIs:
 
 ```powershell
 ./scripts/package.ps1 -Abi all
 ```
 
-After the build finishes, import the generated `.levipack` into LeviLauncher.
-
-## Customize Mod Info
-
-Common CMake options:
-
-```powershell
-cmake -S . -B build-arm64-v8a `
-  -G Ninja `
-  -DCMAKE_TOOLCHAIN_FILE="$env:ANDROID_HOME/ndk/28.2.13676358/build/cmake/android.toolchain.cmake" `
-  -DANDROID_ABI=arm64-v8a `
-  -DANDROID_PLATFORM=android-28 `
-  -DANDROID_STL=c++_shared `
-  -DMOD_ID=clange_me `
-  -DMOD_NAME="Clange Me Mod" `
-  -DMOD_AUTHOR="clange_me" `
-  -DMOD_VERSION=0.1.0 `
-  -DMOD_LIBRARY_NAME=clange_me `
-  -DMOD_MINECRAFT_VERSIONS='["1.21.*"]' `
-  "-DMOD_ICON="
-
-cmake --build build-arm64-v8a --target levi_package
-```
-
-## Lifecycle
-
-Write your mod logic in [src/mod/MyMod.cpp](src/mod/MyMod.cpp):
-
-```cpp
-ClangeMeMod::ClangeMeMod() : mSelf(*ll::mod::NativeMod::current()) {}
-
-bool ClangeMeMod::load() {
-    getSelf().getLogger().debug("Loading...");
-    return true;
-}
-
-bool ClangeMeMod::enable() {
-    getSelf().getLogger().debug("Enabling...");
-    return true;
-}
-
-bool ClangeMeMod::disable() {
-    getSelf().getLogger().debug("Disabling...");
-    return true;
-}
-
-bool ClangeMeMod::unload() {
-    getSelf().getLogger().debug("Unloading...");
-    return true;
-}
-```
-
-`ll::mod::NativeMod::current()` is available while the mod instance is being
-registered, so the constructor can keep the loader-provided `mSelf` reference.
-Register one long-lived mod object with `PL_REGISTER_MOD`.
-
-Lifecycle meaning:
-
-1. `load()` runs when the mod is loaded.
-2. `enable()` runs before the game starts.
-3. `disable()` runs when the game is closing.
-4. `unload()` runs during final mod cleanup.
-
-Common APIs:
-
-- `getSelf().getLogger()`
-- `getSelf().getId()`
-- `getSelf().getName()`
-- `getSelf().getModDir()`
-- `getSelf().getDataDir()`
-- `getSelf().getConfigDir()`
-- `getSelf().getResourceDir()`
-
-Use `getSelf().getDataDir()` and `getSelf().getConfigDir()` for your mod's own data and config
-files.
-
-## Typed Config
-
-The template includes a minimal typed config in `src/mod/Config.h`:
-
-```cpp
-struct ModConfig {
-    int version = 1;
-    bool enabled = true;
-    std::string message = "Hello from clange_me";
-};
-```
-
-`ClangeMeMod::load()` uses `pl::config::ConfigFile<ModConfig>` to create and update
-`config/config.json`. The package script runs `src/config_generator.cpp` before
-Android compilation and includes generated `config.json` and
-`config.schema.json` in the `.levipack`.
-
-Keep this config small for your starter mod. Move larger examples, advanced
-schema coverage, or behavior tests into a separate project.
+The generated `.levipack` can then be imported into LeviLauncher. The package version and Minecraft version range remain configurable through CMake cache variables.

@@ -1,17 +1,17 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(levilauncher_android_mod_template LANGUAGES CXX)
+project(mc_vhs_port LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-set(MOD_ID "clange_me" CACHE STRING "LeviLauncher mod package directory name")
-set(MOD_NAME "Clange Me Mod" CACHE STRING "LeviLauncher mod display name")
-set(MOD_AUTHOR "clange_me" CACHE STRING "LeviLauncher mod author")
+set(MOD_ID "mc_vhs_port" CACHE STRING "LeviLauncher mod package directory name")
+set(MOD_NAME "MC VHS PORT" CACHE STRING "LeviLauncher mod display name")
+set(MOD_AUTHOR "Thinh2252" CACHE STRING "LeviLauncher mod author")
 set(MOD_VERSION "0.1.0" CACHE STRING "LeviLauncher mod version")
-set(MOD_LIBRARY_NAME "clange_me" CACHE STRING "Native library name without lib prefix or .so suffix")
+set(MOD_LIBRARY_NAME "mc_vhs_port" CACHE STRING "Native library name without lib prefix or .so suffix")
 set(MOD_MINECRAFT_VERSIONS "[\"1.26.*\"]" CACHE STRING "Raw JSON array for manifest minecraft_versions")
 set(MOD_ICON "" CACHE STRING "Optional package-relative icon path, such as icon.png")
 
@@ -75,7 +75,7 @@ if(NOT ANDROID)
     add_custom_target(levi_generate_config
         COMMAND levi_config_generator "${LEVI_GENERATED_CONFIG_DIR}"
         DEPENDS levi_config_generator
-        COMMENT "Generating config.json and config.schema.json"
+        COMMENT "Generating MC VHS PORT config.json and config.schema.json"
         VERBATIM
     )
 
@@ -120,6 +120,7 @@ add_library(${MOD_LIBRARY_NAME} SHARED
     src/main.cpp
     src/mod/Config.cpp
     src/mod/MyMod.cpp
+    src/render/PostProcessing.cpp
 )
 
 set_target_properties(${MOD_LIBRARY_NAME} PROPERTIES
@@ -143,8 +144,14 @@ target_link_options(${MOD_LIBRARY_NAME}
 )
 
 find_library(log-lib log REQUIRED)
+find_library(egl-lib EGL REQUIRED)
+find_library(glesv3-lib GLESv3 REQUIRED)
+find_library(dl-lib dl REQUIRED)
 target_link_libraries(${MOD_LIBRARY_NAME} PRIVATE
     ${log-lib}
+    ${egl-lib}
+    ${glesv3-lib}
+    ${dl-lib}
     nlohmann_json::nlohmann_json
     Boost::pfr
     magic_enum::magic_enum
@@ -186,7 +193,7 @@ if(NOT MOD_ICON STREQUAL "")
         message(FATAL_ERROR "MOD_ICON must be a package-relative path")
     endif()
 
-    if(MOD_ICON MATCHES "(^|/)\\.\\.(/|$)")
+    if(MOD_ICON MATCHES "(^|/)\.\.(/|$)")
         message(FATAL_ERROR "MOD_ICON must not contain ..")
     endif()
 
@@ -214,6 +221,6 @@ add_custom_target(levi_package
     COMMAND "${CMAKE_COMMAND}" -E chdir "${LEVI_PACKAGE_ROOT}" "${CMAKE_COMMAND}" -E tar "cf" "${LEVI_PACKAGE_FILE}" --format=zip "${MOD_ID}"
     WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
     DEPENDS ${MOD_LIBRARY_NAME}
-    COMMENT "Packaging ${MOD_ID} for LeviLauncher"
+    COMMENT "Packaging ${MOD_NAME} for LeviLauncher"
     VERBATIM
 )
