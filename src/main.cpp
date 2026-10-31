@@ -2,4 +2,4 @@
 
 #include <pl/Mod.hpp>
 
-PL_REGISTER_MOD(clange_me::ClangeMeMod, clange_me::ClangeMeMod::instance());
+PL_REGISTER_MOD(mcvhs::McVhsMod, mcvhs::McVhsMod::instance());

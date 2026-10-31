@@ -1,18 +1,21 @@
 #pragma once
 
+#include <atomic>
+#include <mutex>
 #include <optional>
+#include <string_view>
 
 #include "mod/Config.h"
 
 #include <pl/Mod.hpp>
 
-namespace clange_me {
+namespace mcvhs {
 
-class ClangeMeMod {
+class McVhsMod {
   public:
-    static ClangeMeMod &instance();
+    static McVhsMod &instance();
 
-    ClangeMeMod();
+    McVhsMod();
 
     [[nodiscard]] ll::mod::NativeMod &getSelf() const { return mSelf; }
 
@@ -22,9 +25,20 @@ class ClangeMeMod {
     bool unload();
 
   private:
+    void registerMenuModules();
+    void unregisterMenuModules();
+    void handleModuleToggle(std::string_view moduleId, bool enabled);
+    void handleConfigChanged(std::string_view moduleId, std::string_view key,
+                             std::string_view value);
+    void mutateConfig(std::string_view key, std::string_view value);
+    void refreshRuntime();
+
     ll::mod::NativeMod &mSelf;
+    mutable std::mutex mConfigMutex;
     ModConfig mConfig;
     std::optional<pl::config::ConfigFile<ModConfig>> mConfigFile;
+    std::atomic_bool mLifecycleActive{false};
+    bool mMenuRegistered{};
 };
 
-} // namespace clange_me
+} // namespace mcvhs

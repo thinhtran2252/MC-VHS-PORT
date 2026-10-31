@@ -33,9 +33,9 @@ int main(int argc, char **argv) {
     }
 
     const std::filesystem::path outputDir = argv[1];
-    if (!writeJson(outputDir / "config.json", clange_me::makeDefaultConfigJson()))
+    if (!writeJson(outputDir / "config.json", mcvhs::makeDefaultConfigJson()))
         return 1;
-    if (!writeJson(outputDir / "config.schema.json", clange_me::makeConfigSchemaJson()))
+    if (!writeJson(outputDir / "config.schema.json", mcvhs::makeConfigSchemaJson()))
         return 1;
 
     return 0;

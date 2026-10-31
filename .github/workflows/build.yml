@@ -1,4 +1,4 @@
-name: Build
+name: MC VHS PORT Build
 
 on:
   push:
@@ -33,7 +33,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: levilauncher-android-mod-template
+          name: mc-vhs-port
           path: build-*/*.levipack
 
       - name: Publish release assets
