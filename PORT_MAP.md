@@ -1,18 +1,32 @@
-# Port map: Java shader to Bedrock native pass
+# MC VHS Java -> Levi native port map (0.2.0)
 
-| Java source | Effect | Port state | Notes |
+Reference source: https://github.com/thinhtran2252/mcvhs
+Levi API/lifecycle reference: https://github.com/thinhtran2252/LeviPostFX
+
+| Java source | Effect | 0.2.0 status | Why / implementation |
 |---|---|---|---|
-| `composite2.fsh` | Aspect-ratio crop, lens distortion | Implemented | Same horizontal crop factor and radial warp formula. |
-| `composite2.fsh` | Interlacing | Approximation | Uses a time-varying scanline offset because the final EGL hook does not receive camera displacement. |
-| `composite2.fsh` | Static, exposure, manual exposure, contrast curve, white noise | Implemented / approximated | Procedural noise replaces the Java `4ChannelNoise.png` texture. The exposure samples the generated framebuffer mip chain. |
-| `composite4.fsh` | Tonemapping | Implemented | Supports none, tanh-equivalent, Beer/exponential, and Reinhard methods. Bloom remains deferred. |
-| `composite5.fsh` | YUV / YIQ / YCbCr compression | Implemented | Reads LODs from the captured screen mip chain and applies the preceding composite color operations to those samples. |
-| `composite6.fsh` | Extra zoom, side jitter, sharpness | Implemented / approximated | Runs in the combined final pass; exact Java intermediate-buffer ordering is not available in this first pipeline. |
-| `composite3.fsh`, `Bloom.glsl` | Horizontal / vertical bloom | Deferred | Requires dedicated intermediate targets and a separate blur pass. |
-| `composite.fsh` | Torch, held-item light, distance fog | Deferred | Requires held-item/world position and other game-side data. |
-| `composite1.fsh` | SSR, reflection, surface Fresnel | Deferred | Requires depth, normal, roughness, and camera matrices. |
-| `gbuffers_water.fsh`, `Vertex_Lit.glsl`, `Fragment_Lit.glsl` | Material, water, lighting effects | Deferred | These are geometry/material stages, not final-screen-only effects. |
+| `composite2.fsh` | Aspect ratio | Implemented | Same horizontal UV scale `1.2` and crop boundary. |
+| `composite2.fsh` | Lens distortion | Implemented | Same radial UV warp equation and strength control. |
+| `composite2.fsh` | Static noise | Implemented | Ports the `RandomValue` / normal-distribution / `RandomDirection` PRNG and YUV channel offset. |
+| `composite2.fsh` | Contrast curve | Implemented | Same `(x + x) / (2 - x)` curve. |
+| `composite2.fsh` | Auto exposure | Implemented | Samples LOD 8 from the captured scene mip chain and applies `averageLuma + 0.5`. |
+| `composite2.fsh` | Manual exposure | Implemented | Same multiply after optional auto exposure. |
+| `composite2.fsh` | Interlacing | Deferred | Requires previous/current camera position delta, not available at final EGL swap. |
+| `composite2.fsh` | White-noise bursts | Deferred | Requires the Java `Spotlight.png` / `colortex6` sample. |
+| `composite3.fsh` + `Bloom.glsl` | Horizontal bloom | Deferred | Needs a dedicated bloom target and blur pass. |
+| `composite4.fsh` | Vertical bloom | Deferred | Needs bloom target from the preceding pass. |
+| `composite4.fsh` | Tonemapping | Implemented | Tanh-equivalent, Beer/exponential and Reinhard methods. |
+| `composite5.fsh` | YUV / YIQ / YCbCr compression | Implemented | Reads LODs from the tonemapped intermediate mip chain and uses the source transforms. |
+| `composite6.fsh` | Extra zoom | Implemented | Same centred coordinate scaling. |
+| `composite6.fsh` | Side jitter | Implemented | Same seeded random distribution and amount. |
+| `composite6.fsh` | Sharpness | Implemented | Same negative-strength mix with the requested mip LOD. |
+| `composite.fsh` | Torch | Deferred | Needs world depth, held light/item data and spotlight texture. |
+| `composite.fsh` | Fog | Deferred | Needs depth reconstruction, near/far, fog color and underwater state. |
+| `composite1.fsh` | SSR / sky reflection | Deferred | Needs depth, normal/specular targets and camera matrices. |
+| `gbuffers_water.fsh`, `Vertex_Lit.glsl`, `Fragment_Lit.glsl` | Water / material lighting | Deferred | Geometry/material passes cannot be faithfully produced from the final framebuffer alone. |
 
-## Config parity
+## Render order implemented
 
-`PROFILE=0` applies the Java `Default` values for effects currently ported. `PROFILE=1` applies the Java `DeepFried` values. The Mod Menu page names mirror the Java `Lens`, `Compression`, `Post Processing`, and `User Suggestions` screens. Option IDs retain their Java names in `config.json` and in the Mod Menu config entries, including `USE_LENS_DISTORTION`, `LENS_DISTORTION_STRENGTH`, `ASPECT_RATIO`, `USE_INTERLACING`, `STATIC_STRENGTH`, `AUTO_EXPOSURE`, `MANUAL_EXPOSURE`, `TONEMAPPING_METHOD`, `COMPRESSION_METHOD`, `LUMA_COMPRESSION`, `CHROMA_COMPRESSION`, `CHROMA_BOOST`, `USE_SHARPNESS`, `SHARPNESS_STRENGTH`, `SHARPNESS_RADIUS`, `EXTRA_ZOOM`, and `SIDE_JITTER`.
+`capture -> composite2 -> mipmap -> composite4 tonemap -> mipmap -> composite5 compression -> mipmap -> composite6 -> EGL surface`
+
+Bloom is omitted from the chain for now; it is not replaced with a fake glow filter.

@@ -1,9 +1,5 @@
 build*/
-out/
-dist/
+.cache/
 .vs/
-.vscode/.cmake/
 .idea/
-*.zip
-*.so
-*.log
+*.user

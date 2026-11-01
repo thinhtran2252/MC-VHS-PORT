@@ -1,8 +1,8 @@
 #include "render/PostProcessing.h"
 
-#include <GLES3/gl3.h>
 #include <android/log.h>
 #include <dlfcn.h>
+#include <pl/memory/Hook.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -10,77 +10,105 @@
 #include <cstdint>
 #include <string>
 
-#include <pl/memory/Hook.hpp>
-
 namespace mcvhs {
 namespace {
 
+constexpr char kLogTag[] = "MCVHS-PORT";
 using EglSwapBuffersFn = EGLBoolean (*)(EGLDisplay, EGLSurface);
-constexpr const char *kLogTag = "MCVHS-PORT";
-const auto kProcessStart = std::chrono::steady_clock::now();
+const auto kStartTime = std::chrono::steady_clock::now();
 
-const char *kVertexShader = R"GLSL(
-#version 300 es
+void logMessage(int priority, const char* message) {
+    __android_log_print(priority, kLogTag, "%s", message);
+}
+
+GLuint compileShader(GLenum type, const char* source) {
+    const GLuint shader = glCreateShader(type);
+    if (!shader) {
+        logMessage(ANDROID_LOG_ERROR, "glCreateShader failed");
+        return 0;
+    }
+    glShaderSource(shader, 1, &source, nullptr);
+    glCompileShader(shader);
+    GLint compiled = GL_FALSE;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+    if (compiled == GL_TRUE) return shader;
+
+    GLint length = 0;
+    glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &length);
+    std::string info(static_cast<std::size_t>(std::max(length, 1)), '\0');
+    glGetShaderInfoLog(shader, length, nullptr, info.data());
+    __android_log_print(ANDROID_LOG_ERROR, kLogTag, "GLSL compile failed: %s", info.c_str());
+    glDeleteShader(shader);
+    return 0;
+}
+
+constexpr char kVertexShader[] = R"GLSL(#version 300 es
 precision highp float;
-out vec2 vUv;
+out vec2 vTexCoord;
 void main() {
+    // Oversized fullscreen triangle. vTexCoord must be p, not p * 0.5.
     vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
-    vUv = p * 0.5;
+    vTexCoord = p;
     gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
 }
 )GLSL";
 
-const char *kFragmentShader = R"GLSL(
-#version 300 es
+constexpr char kFragmentShader[] = R"GLSL(#version 300 es
 precision highp float;
 precision highp int;
-in vec2 vUv;
+in vec2 vTexCoord;
 out vec4 fragColor;
 
 uniform sampler2D uScene;
 uniform vec2 uResolution;
 uniform float uTime;
+uniform float uMaxMip;
+uniform int uStage; // 0 composite2, 1 composite4, 2 composite5, 3 composite6
 
-uniform int uLensGroup;
-uniform int uCompressionGroup;
-uniform int uPostGroup;
-uniform int uSignalGroup;
-uniform int uUserSuggestionsGroup;
-
-uniform int uAspectRatio;
-uniform int uLensDistortion;
-uniform float uLensDistortionStrength;
-uniform int uInterlacing;
-uniform float uInterlacingStrength;
-uniform int uStaticNoise;
+uniform int uUseStatic;
 uniform float uStaticStrength;
-uniform int uMoreStatic;
-uniform int uSideJitter;
-uniform float uSideJitterAmount;
+uniform int uUseLensDistortion;
+uniform float uLensDistortionStrength;
+uniform int uAspectRatio;
 uniform int uAutoExposure;
 uniform float uManualExposure;
 uniform int uTonemapMethod;
-uniform float uExtraZoom;
-uniform int uSharpness;
-uniform float uSharpnessStrength;
-uniform float uSharpnessRadius;
 uniform int uCompressionMethod;
 uniform float uLumaCompression;
 uniform float uChromaCompression;
 uniform float uChromaBoost;
+uniform float uExtraZoom;
+uniform int uUseSharpness;
+uniform float uSharpnessStrength;
+uniform float uSharpnessRadius;
+uniform int uSideJitter;
+uniform float uSideJitterAmount;
 
-float hash12(vec2 p) {
-    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
-    p3 += dot(p3, p3.yzx + 33.33);
-    return fract((p3.x + p3.y) * p3.z);
+float randomValue(inout uint state) {
+    state = state * 747796405u + 2891336453u;
+    uint result = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    result = (result >> 22u) ^ result;
+    state *= result;
+    return float(result) / 4294967295.0;
 }
 
-vec3 rgb2yuv(vec3 rgb) {
-    float y = dot(rgb, vec3(0.299, 0.587, 0.114));
+float randomNormal(inout uint state) {
+    float theta = 6.28318530718 * randomValue(state);
+    float rho = sqrt(-2.0 * log(max(randomValue(state), 1.0e-7)));
+    state += uint(rho * cos(theta));
+    return rho * cos(theta);
+}
+
+vec3 randomDirection(inout uint state) {
+    return normalize(vec3(randomNormal(state), randomNormal(state), randomNormal(state)));
+}
+
+vec3 rgbToYuv(vec3 rgb) {
+    float y = 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
     return vec3(y, 0.493 * (rgb.b - y), 0.877 * (rgb.r - y));
 }
 
-vec3 yuv2rgb(vec3 yuv) {
+vec3 yuvToRgb(vec3 yuv) {
     return vec3(
         yuv.x + (1.0 / 0.877) * yuv.z,
         yuv.x - 0.39393 * yuv.y - 0.58081 * yuv.z,
@@ -88,483 +116,497 @@ vec3 yuv2rgb(vec3 yuv) {
     );
 }
 
-vec3 rgb2yiq(vec3 c) {
-    return vec3(
-        dot(c, vec3(0.299, 0.587, 0.114)),
-        dot(c, vec3(0.596, -0.274, -0.322)),
-        dot(c, vec3(0.211, -0.523, 0.312))
-    );
-}
-
-vec3 yiq2rgb(vec3 c) {
-    return vec3(
-        c.x + 0.956 * c.y + 0.621 * c.z,
-        c.x - 0.272 * c.y - 0.647 * c.z,
-        c.x - 1.106 * c.y + 1.703 * c.z
-    );
-}
-
-vec3 rgb2ycbcr(vec3 c) {
-    float y = dot(c, vec3(0.299, 0.587, 0.114));
+vec3 rgbToYcbcr(vec3 c) {
+    float y = 0.299 * c.r + 0.587 * c.g + 0.114 * c.b;
     return vec3(y, (c.b - y) * 0.565, (c.r - y) * 0.713);
 }
 
-vec3 ycbcr2rgb(vec3 c) {
-    return vec3(
-        c.x + 1.403 * c.z,
-        c.x - 0.344 * c.y - 0.714 * c.z,
-        c.x + 1.770 * c.y
-    );
+vec3 ycbcrToRgb(vec3 c) {
+    return vec3(c.x + 1.403 * c.z,
+                c.x - 0.344 * c.y - 0.714 * c.z,
+                c.x + 1.770 * c.y);
 }
 
-vec3 applyTonemap(vec3 color) {
-    if (uPostGroup == 0)
-        return color;
-    if (uTonemapMethod == 1) {
-        vec3 x = clamp(color, vec3(-10.0), vec3(10.0));
-        return 2.0 / (1.0 + exp(-2.0 * x)) - 1.0;
+vec3 rgbToYiq(vec3 rgb) {
+    // Same GLSL matrix/vector multiplication as composite5.fsh.
+    const mat3 transform = mat3(
+        0.299, 0.596, 0.211,
+        0.587, -0.274, -0.523,
+        0.114, -0.322, 0.312
+    );
+    return rgb * transform;
+}
+
+vec3 yiqToRgb(vec3 yiq) {
+    const mat3 transform = mat3(
+        1.0, 1.0, 1.0,
+        0.956, -0.272, -1.106,
+        0.621, -0.647, 1.703
+    );
+    return yiq * transform;
+}
+
+vec4 composite2(vec2 texCoord) {
+    vec2 uv = texCoord;
+    if (uAspectRatio != 0)
+        uv.x = (uv.x - 0.5) * 1.2 + 0.5;
+
+    if (uUseLensDistortion != 0) {
+        uv = uv * 2.0 - 1.0;
+        uv *= 1.0 + uLensDistortionStrength * dot(uv, uv);
+        uv = uv * 0.5 + 0.5;
     }
-    if (uTonemapMethod == 2)
-        return 1.0 - exp(-max(color, vec3(0.0)));
-    if (uTonemapMethod == 3)
-        return color / (1.0 + max(color, vec3(0.0)));
+
+    vec4 color = texture(uScene, uv);
+    if (uUseStatic != 0) {
+        uvec2 pixel = uvec2(texCoord * uResolution);
+        pixel = (pixel / 4u) * 4u;
+        uint pixelIndex = pixel.y * uint(uResolution.x) + pixel.x;
+        uint seed = pixelIndex + uint(fract(uTime) * uResolution.y * uResolution.y);
+        vec3 noise = randomDirection(seed);
+        vec3 yuv = rgbToYuv(color.rgb);
+        yuv.yz += noise.xy * uStaticStrength;
+        color.rgb = yuvToRgb(yuv);
+    }
+
+    // Source composite2 applies this curve unconditionally.
+    color.rgb = (color.rgb + color.rgb) / max(vec3(0.0001), vec3(2.0) - color.rgb);
+    if (uAutoExposure != 0) {
+        float averageLuma = rgbToYuv(textureLod(uScene, vec2(0.5), min(8.0, uMaxMip)).rgb).x + 0.5;
+        color.rgb /= max(averageLuma, 0.0001);
+    }
+    color.rgb *= uManualExposure;
+    color.rgb = clamp(color.rgb, vec3(0.0), vec3(10.0));
+
+    // Java composite2 explicitly blacks pixels outside the horizontal crop.
+    if (uv.x < 0.0 || uv.x > 1.0) color.rgb = vec3(0.0);
     return color;
 }
 
-vec3 processComposite2(vec2 uv, float lod) {
-    vec3 color = textureLod(uScene, clamp(uv, vec2(0.0), vec2(1.0)), lod).rgb;
-
-    if (uSignalGroup != 0 && uStaticNoise != 0) {
-        vec2 block = floor(uv * uResolution / 4.0);
-        float frameSeed = floor(uTime * 24.0);
-        vec2 noise = vec2(hash12(block + frameSeed), hash12(block.yx + frameSeed + 13.0)) - 0.5;
-        noise *= uStaticStrength / exp2(max(lod, 0.0) * 0.5);
-        vec3 yuv = rgb2yuv(color);
-        yuv.yz += noise;
-        color = yuv2rgb(yuv);
+vec4 composite4(vec4 color) {
+    if (uTonemapMethod == 1) {
+        vec3 x = clamp(color.rgb, vec3(-10.0), vec3(10.0));
+        color.rgb = 2.0 / (1.0 + exp(-2.0 * x)) - 1.0;
+    } else if (uTonemapMethod == 2) {
+        color.rgb = 1.0 - exp(-color.rgb);
+    } else if (uTonemapMethod == 3) {
+        color.rgb = color.rgb / (1.0 + color.rgb);
     }
-
-    // This contrast curve is always active in the original composite2 pass.
-    color = (color + color) / max(vec3(0.001), vec3(2.0) - color);
-    if (uLensGroup != 0 && uAutoExposure != 0) {
-        float averageLuma = rgb2yuv(textureLod(uScene, vec2(0.5), 8.0).rgb).x + 0.5;
-        color /= max(averageLuma, 0.001);
-    }
-    if (uLensGroup != 0)
-        color *= uManualExposure;
-
-    if (uPostGroup != 0 && uMoreStatic != 0) {
-        vec2 pixel = floor(uv * uResolution);
-        float frameSeed = floor(uTime * 36.0);
-        float whiteBitA = step(0.992, hash12(pixel + frameSeed));
-        float whiteBitB = step(0.60, hash12(pixel.yx - frameSeed + 41.0));
-        float whiteBits = whiteBitA * whiteBitB / exp2(max(lod, 0.0));
-        color = mix(color, vec3(1.0), whiteBits);
-    }
-    return clamp(color, vec3(0.0), vec3(10.0));
+    return color;
 }
 
-vec3 processComposite5(vec2 uv, float outputLod) {
-    if (uCompressionGroup == 0)
-        return applyTonemap(processComposite2(uv, outputLod));
-
-    float lumaLod = clamp(outputLod + uLumaCompression, 0.0, 12.0);
-    float chromaLod = clamp(outputLod + uChromaCompression, 0.0, 12.0);
-    vec3 lumaSample = applyTonemap(processComposite2(uv, lumaLod));
-    vec3 chromaSample = applyTonemap(processComposite2(uv, chromaLod));
+vec4 composite5(vec2 uv) {
+    vec4 base = texture(uScene, uv);
+    float lumaLod = min(uLumaCompression, uMaxMip);
+    float chromaLod = min(uChromaCompression, uMaxMip);
+    vec3 lumaSource = textureLod(uScene, uv, lumaLod).rgb;
+    vec3 chromaSource = textureLod(uScene, uv, chromaLod).rgb;
+    vec3 result;
 
     if (uCompressionMethod == 0) {
-        float y = rgb2yuv(lumaSample).x;
-        vec2 chroma = rgb2yuv(chromaSample).yz * (1.0 + uChromaBoost);
-        return yuv2rgb(vec3(y, chroma));
+        float y = rgbToYuv(lumaSource).x;
+        vec2 uvChroma = rgbToYuv(chromaSource).yz * (1.0 + uChromaBoost);
+        result = yuvToRgb(vec3(y, uvChroma));
+    } else if (uCompressionMethod == 1) {
+        float y = rgbToYiq(lumaSource).x;
+        vec2 iq = rgbToYiq(chromaSource).yz * (1.0 + uChromaBoost);
+        result = yiqToRgb(vec3(y, iq));
+    } else {
+        float y = rgbToYcbcr(lumaSource).x;
+        vec2 cbcr = rgbToYcbcr(chromaSource).yz * (1.0 + uChromaBoost);
+        result = ycbcrToRgb(vec3(y, cbcr));
     }
-    if (uCompressionMethod == 1) {
-        float y = rgb2yiq(lumaSample).x;
-        vec2 chroma = rgb2yiq(chromaSample).yz * (1.0 + uChromaBoost);
-        return yiq2rgb(vec3(y, chroma));
+    base.rgb = result;
+    return base;
+}
+
+vec4 composite6(vec2 texCoord) {
+    vec2 coord = texCoord * 2.0 - 1.0;
+    coord /= 1.0 + uExtraZoom;
+    coord = coord * 0.5 + 0.5;
+
+    if (uSideJitter != 0) {
+        uint seed = uint(fract(uTime) * 10000.0);
+        float jitter = (pow(randomValue(seed), 2.0) * 2.0 - 1.0) * uSideJitterAmount;
+        coord.x += jitter;
     }
 
-    float y = rgb2ycbcr(lumaSample).x;
-    vec2 chroma = rgb2ycbcr(chromaSample).yz * (1.0 + uChromaBoost);
-    return ycbcr2rgb(vec3(y, chroma));
+    vec4 color = texture(uScene, coord);
+    if (uUseSharpness != 0) {
+        vec3 blurred = textureLod(uScene, coord, min(uSharpnessRadius, uMaxMip)).rgb;
+        color.rgb = mix(color.rgb, blurred, -uSharpnessStrength);
+    }
+    return color;
 }
 
 void main() {
-    vec2 uv = vUv;
-
-    // composite6: zoom and horizontal jitter. Applied before the single
-    // framebuffer sample because this Bedrock hook currently uses one pass.
-    if (uPostGroup != 0 && uExtraZoom > 0.0) {
-        uv = (uv * 2.0 - 1.0) / (1.0 + uExtraZoom);
-        uv = uv * 0.5 + 0.5;
-    }
-    if (uUserSuggestionsGroup != 0 && uSideJitter != 0) {
-        float frameSeed = floor(uTime * 30.0);
-        float jitter = (hash12(vec2(frameSeed, 17.0)) * 2.0 - 1.0) * uSideJitterAmount;
-        uv.x += jitter;
-    }
-
-    // composite2: display shaping and lens warp.
-    if (uSignalGroup != 0 && uAspectRatio != 0)
-        uv.x = (uv.x - 0.5) * 1.2 + 0.5;
-    if (uLensGroup != 0 && uLensDistortion != 0) {
-        vec2 centered = uv * 2.0 - 1.0;
-        centered *= 1.0 + uLensDistortionStrength * dot(centered, centered);
-        uv = centered * 0.5 + 0.5;
-    }
-    if (uSignalGroup != 0 && uInterlacing != 0) {
-        // Java scales this offset by camera displacement. The final EGL hook
-        // has no camera transform, so use a time-varying scanline phase.
-        float band = fract(uv.y * (uResolution.y / 10.0)) > 0.5 ? 1.0 : 0.0;
-        uv.x += band * (2.0 / uResolution.x) * (uInterlacingStrength / 20.0) * sin(uTime * 12.0);
-    }
-
-    vec3 processed = processComposite2(uv, 0.0);
-    processed = applyTonemap(processed);
-
-    // composite5: chroma channels are sampled from the already processed
-    // composite2 + tonemapping result, including its generated screen mips.
-    if (uCompressionGroup != 0)
-        processed = processComposite5(uv, 0.0);
-
-    // composite6: approximate the blurred mip of the prior processed passes.
-    if (uPostGroup != 0 && uSharpness != 0) {
-        vec3 blurred = processComposite5(uv, uSharpnessRadius);
-        processed = mix(processed, blurred, -uSharpnessStrength);
-    }
-
-    vec4 originalPixel = texture(uScene, clamp(uv, vec2(0.0), vec2(1.0)));
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
-        processed = vec3(0.0);
-
-    fragColor = vec4(clamp(processed, vec3(0.0), vec3(10.0)), originalPixel.a);
+    if (uStage == 0) fragColor = composite2(vTexCoord);
+    else if (uStage == 1) fragColor = composite4(texture(uScene, vTexCoord));
+    else if (uStage == 2) fragColor = composite5(vTexCoord);
+    else fragColor = composite6(vTexCoord);
 }
 )GLSL";
 
-void logMessage(int priority, const char *message) {
-    __android_log_print(priority, kLogTag, "%s", message);
-}
+struct SavedGlState {
+    GLint drawFramebuffer{};
+    GLint readFramebuffer{};
+    GLint viewport[4]{};
+    GLint program{};
+    GLint vertexArray{};
+    GLint activeTexture{};
+    GLint texture0{};
+    GLint sampler0{};
+    GLboolean colorMask[4]{GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE};
+    GLboolean blend{};
+    GLboolean depth{};
+    GLboolean stencil{};
+    GLboolean scissor{};
+    GLboolean cull{};
 
-GLuint compileShader(GLenum type, const char *source) {
-    GLuint shader = glCreateShader(type);
-    if (!shader)
-        return 0;
-    glShaderSource(shader, 1, &source, nullptr);
-    glCompileShader(shader);
-
-    GLint compiled = GL_FALSE;
-    glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
-    if (compiled == GL_TRUE)
-        return shader;
-
-    GLint logLength = 0;
-    glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &logLength);
-    std::string log(static_cast<size_t>(std::max(logLength, 1)), '\0');
-    glGetShaderInfoLog(shader, logLength, nullptr, log.data());
-    __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Shader compile failed: %s", log.c_str());
-    glDeleteShader(shader);
-    return 0;
-}
-
-GLuint createProgram() {
-    GLuint vertex = compileShader(GL_VERTEX_SHADER, kVertexShader);
-    GLuint fragment = compileShader(GL_FRAGMENT_SHADER, kFragmentShader);
-    if (!vertex || !fragment) {
-        if (vertex) glDeleteShader(vertex);
-        if (fragment) glDeleteShader(fragment);
-        return 0;
+    void capture() {
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFramebuffer);
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFramebuffer);
+        glGetIntegerv(GL_VIEWPORT, viewport);
+        glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+        glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vertexArray);
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &activeTexture);
+        glActiveTexture(GL_TEXTURE0);
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture0);
+        glGetIntegerv(GL_SAMPLER_BINDING, &sampler0);
+        glGetBooleanv(GL_COLOR_WRITEMASK, colorMask);
+        blend = glIsEnabled(GL_BLEND);
+        depth = glIsEnabled(GL_DEPTH_TEST);
+        stencil = glIsEnabled(GL_STENCIL_TEST);
+        scissor = glIsEnabled(GL_SCISSOR_TEST);
+        cull = glIsEnabled(GL_CULL_FACE);
+        glActiveTexture(static_cast<GLenum>(activeTexture));
     }
 
-    GLuint program = glCreateProgram();
-    glAttachShader(program, vertex);
-    glAttachShader(program, fragment);
-    glLinkProgram(program);
-    glDeleteShader(vertex);
-    glDeleteShader(fragment);
+    void restore() const {
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(drawFramebuffer));
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(readFramebuffer));
+        glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+        glUseProgram(static_cast<GLuint>(program));
+        glBindVertexArray(static_cast<GLuint>(vertexArray));
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(texture0));
+        glBindSampler(0, static_cast<GLuint>(sampler0));
+        glColorMask(colorMask[0], colorMask[1], colorMask[2], colorMask[3]);
+        blend ? glEnable(GL_BLEND) : glDisable(GL_BLEND);
+        depth ? glEnable(GL_DEPTH_TEST) : glDisable(GL_DEPTH_TEST);
+        stencil ? glEnable(GL_STENCIL_TEST) : glDisable(GL_STENCIL_TEST);
+        scissor ? glEnable(GL_SCISSOR_TEST) : glDisable(GL_SCISSOR_TEST);
+        cull ? glEnable(GL_CULL_FACE) : glDisable(GL_CULL_FACE);
+        glActiveTexture(static_cast<GLenum>(activeTexture));
+    }
+};
 
-    GLint linked = GL_FALSE;
-    glGetProgramiv(program, GL_LINK_STATUS, &linked);
-    if (linked == GL_TRUE)
-        return program;
-
-    GLint logLength = 0;
-    glGetProgramiv(program, GL_INFO_LOG_LENGTH, &logLength);
-    std::string log(static_cast<size_t>(std::max(logLength, 1)), '\0');
-    glGetProgramInfoLog(program, logLength, nullptr, log.data());
-    __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Program link failed: %s", log.c_str());
-    glDeleteProgram(program);
-    return 0;
+void uniform1i(GLuint program, const char* name, GLint value) {
+    const GLint location = glGetUniformLocation(program, name);
+    if (location >= 0) glUniform1i(location, value);
 }
-
-GLint uniform(GLuint program, const char *name) {
-    return glGetUniformLocation(program, name);
-}
-
-void setInt(GLuint program, const char *name, int value) {
-    const GLint loc = uniform(program, name);
-    if (loc >= 0) glUniform1i(loc, value);
-}
-
-void setFloat(GLuint program, const char *name, float value) {
-    const GLint loc = uniform(program, name);
-    if (loc >= 0) glUniform1f(loc, value);
+void uniform1f(GLuint program, const char* name, GLfloat value) {
+    const GLint location = glGetUniformLocation(program, name);
+    if (location >= 0) glUniform1f(location, value);
 }
 
 } // namespace
 
-PostProcessing &PostProcessing::instance() {
+PostProcessing& PostProcessing::instance() {
     static PostProcessing instance;
     return instance;
 }
 
-void PostProcessing::setConfig(const ModConfig &config) {
+void PostProcessing::setConfig(const ModConfig& config) {
     std::lock_guard<std::mutex> lock(mConfigMutex);
     mConfig = config;
 }
 
 bool PostProcessing::start() {
-    std::lock_guard<std::mutex> hookLock(mHookMutex);
-    if (mHookInstalled)
-        return true;
+    std::lock_guard<std::mutex> lock(mHookMutex);
+    if (mHookInstalled) return true;
 
-    if (!mEglHandle) {
-        mEglHandle = dlopen("libEGL.so", RTLD_NOW | RTLD_LOCAL);
-    }
-    if (!mEglHandle) {
-        logMessage(ANDROID_LOG_ERROR, "Could not load libEGL.so; post-processing hook was not installed.");
+    if (!mEglLibrary) mEglLibrary = dlopen("libEGL.so", RTLD_NOW | RTLD_LOCAL);
+    if (!mEglLibrary) {
+        logMessage(ANDROID_LOG_ERROR, "Could not open libEGL.so; post-processing hook not installed");
         return false;
     }
-
-    mSwapTarget = dlsym(mEglHandle, "eglSwapBuffers");
+    mSwapTarget = dlsym(mEglLibrary, "eglSwapBuffers");
     if (!mSwapTarget) {
-        logMessage(ANDROID_LOG_ERROR, "eglSwapBuffers was not found in libEGL.so.");
+        logMessage(ANDROID_LOG_ERROR, "eglSwapBuffers symbol not found");
         return false;
     }
 
-    void *originalSwap = nullptr;
+    void* original = nullptr;
     const int result = pl::memory::hook(
         reinterpret_cast<pl::memory::FuncPtr>(mSwapTarget),
         reinterpret_cast<pl::memory::FuncPtr>(&PostProcessing::swapBuffersHook),
-        &originalSwap,
+        &original,
         pl::memory::HookPriority::Low);
-    if (result != 0 || !originalSwap) {
-        logMessage(ANDROID_LOG_ERROR, "Failed to hook eglSwapBuffers; effects remain disabled.");
+    if (result != 0 || !original) {
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Failed to install eglSwapBuffers hook: %d", result);
         return false;
     }
-
-    mOriginalSwap.store(originalSwap, std::memory_order_release);
+    mOriginalSwap.store(original, std::memory_order_release);
     mHookInstalled = true;
-    logMessage(ANDROID_LOG_INFO, "eglSwapBuffers hook installed.");
+    logMessage(ANDROID_LOG_INFO, "eglSwapBuffers hook installed");
     return true;
 }
 
 void PostProcessing::stop() {
-    std::lock_guard<std::mutex> hookLock(mHookMutex);
-    if (!mHookInstalled)
-        return;
+    std::lock_guard<std::mutex> lock(mHookMutex);
+    if (!mHookInstalled) return;
     pl::memory::unhook(
         reinterpret_cast<pl::memory::FuncPtr>(mSwapTarget),
         reinterpret_cast<pl::memory::FuncPtr>(&PostProcessing::swapBuffersHook));
     mHookInstalled = false;
-    // Keep the original trampoline alive: a swap callback may already be in
-    // flight on the render thread while disable() removes the hook.
-    logMessage(ANDROID_LOG_INFO, "eglSwapBuffers hook removed.");
+    // Keep EGL and the original trampoline alive for any swap callback already in flight.
+    logMessage(ANDROID_LOG_INFO, "eglSwapBuffers hook removed");
 }
 
 EGLBoolean PostProcessing::swapBuffersHook(EGLDisplay display, EGLSurface surface) {
-    auto &self = PostProcessing::instance();
+    auto& self = PostProcessing::instance();
     self.renderCurrentFrame();
-
     auto original = reinterpret_cast<EglSwapBuffersFn>(self.mOriginalSwap.load(std::memory_order_acquire));
-    if (!original)
-        return EGL_FALSE;
-    return original(display, surface);
+    return original ? original(display, surface) : EGL_FALSE;
 }
 
-bool PostProcessing::ensureGlResources(EGLContext context) {
-    if (context == EGL_NO_CONTEXT)
+bool PostProcessing::ensureProgram() {
+    if (mProgram) return true;
+    const GLuint vertex = compileShader(GL_VERTEX_SHADER, kVertexShader);
+    const GLuint fragment = compileShader(GL_FRAGMENT_SHADER, kFragmentShader);
+    if (!vertex || !fragment) {
+        if (vertex) glDeleteShader(vertex);
+        if (fragment) glDeleteShader(fragment);
+        return false;
+    }
+    const GLuint program = glCreateProgram();
+    glAttachShader(program, vertex);
+    glAttachShader(program, fragment);
+    glLinkProgram(program);
+    glDeleteShader(vertex);
+    glDeleteShader(fragment);
+    GLint linked = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &linked);
+    if (linked != GL_TRUE) {
+        GLint length = 0;
+        glGetProgramiv(program, GL_INFO_LOG_LENGTH, &length);
+        std::string info(static_cast<std::size_t>(std::max(length, 1)), '\0');
+        glGetProgramInfoLog(program, length, nullptr, info.data());
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "GLSL link failed: %s", info.c_str());
+        glDeleteProgram(program);
+        return false;
+    }
+    mProgram = program;
+    return true;
+}
+
+bool PostProcessing::allocateTargets(int width, int height, GLint internalFormat, GLenum type) {
+    const GLuint textures[] = {mCaptureTexture, mLensTexture, mToneTexture, mCompressionTexture};
+    glActiveTexture(GL_TEXTURE0);
+    for (GLuint texture : textures) {
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, internalFormat, width, height, 0, GL_RGBA, type, nullptr);
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, mCaptureFramebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, mCaptureTexture, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return false;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, mWorkFramebuffer);
+    for (GLuint texture : {mLensTexture, mToneTexture, mCompressionTexture}) {
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return false;
+    }
+    mTextureFormat = internalFormat;
+    mTextureType = type;
+    return true;
+}
+
+bool PostProcessing::ensureTargets(int width, int height) {
+    if (width == mTextureWidth && height == mTextureHeight && mCaptureTexture && mLensTexture && mToneTexture && mCompressionTexture)
+        return true;
+
+    if (!mCaptureTexture) glGenTextures(1, &mCaptureTexture);
+    if (!mLensTexture) glGenTextures(1, &mLensTexture);
+    if (!mToneTexture) glGenTextures(1, &mToneTexture);
+    if (!mCompressionTexture) glGenTextures(1, &mCompressionTexture);
+    if (!mCaptureFramebuffer) glGenFramebuffers(1, &mCaptureFramebuffer);
+    if (!mWorkFramebuffer) glGenFramebuffers(1, &mWorkFramebuffer);
+    if (!mCaptureTexture || !mLensTexture || !mToneTexture || !mCompressionTexture || !mCaptureFramebuffer || !mWorkFramebuffer)
         return false;
 
-    if (mGlContext != context) {
-        // GL names belong to the old context. Do not delete them while a
-        // different context is current; simply initialize a fresh set.
-        mGlContext = context;
-        mProgram = 0;
-        mVertexArray = 0;
-        mSceneTexture = 0;
-        mResolveFramebuffer = 0;
+    // Prefer floating-point intermediates so the Java exposure/tonemapping stages
+    // do not clamp HDR values between passes. Fall back for devices without a
+    // renderable RGBA16F framebuffer.
+    bool allocated = allocateTargets(width, height, GL_RGBA16F, GL_HALF_FLOAT);
+    if (!allocated) allocated = allocateTargets(width, height, GL_RGBA8, GL_UNSIGNED_BYTE);
+    if (!allocated) {
+        logMessage(ANDROID_LOG_ERROR, "Could not create complete post-processing framebuffers");
         mTextureWidth = 0;
         mTextureHeight = 0;
-        mShaderFailed = false;
-    }
-
-    if (mShaderFailed)
         return false;
-
-    if (!mProgram) {
-        mProgram = createProgram();
-        if (!mProgram) {
-            mShaderFailed = true;
-            logMessage(ANDROID_LOG_ERROR, "Post-processing shader initialization failed for this EGL context.");
-            return false;
-        }
     }
-    if (!mVertexArray)
-        glGenVertexArrays(1, &mVertexArray);
-    if (!mSceneTexture)
-        glGenTextures(1, &mSceneTexture);
-    if (!mResolveFramebuffer)
-        glGenFramebuffers(1, &mResolveFramebuffer);
 
-    return mProgram != 0 && mVertexArray != 0 && mSceneTexture != 0 && mResolveFramebuffer != 0;
+    const GLint maxLevel = static_cast<GLint>(std::floor(std::log2(static_cast<float>(std::max(width, height)))));
+    for (GLuint texture : {mCaptureTexture, mLensTexture, mToneTexture, mCompressionTexture}) {
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, maxLevel);
+    }
+    mTextureWidth = width;
+    mTextureHeight = height;
+    logMessage(ANDROID_LOG_INFO, mTextureFormat == GL_RGBA16F
+        ? "Allocated RGBA16F intermediate targets" : "Allocated RGBA8 fallback targets; HDR precision reduced");
+    return true;
+}
+
+bool PostProcessing::drawPass(GLuint inputTexture, GLuint outputFramebuffer, GLuint outputTexture,
+                              int stage, int width, int height, const ModConfig& config,
+                              float timeSeconds, float maxMip) {
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, outputFramebuffer);
+    if (outputTexture != 0) {
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, outputTexture, 0);
+        if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return false;
+    }
+    glViewport(0, 0, width, height);
+    glUseProgram(mProgram);
+    glBindVertexArray(mVertexArray);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, inputTexture);
+    glBindSampler(0, 0);
+
+    uniform1i(mProgram, "uScene", 0);
+    uniform1i(mProgram, "uStage", stage);
+    GLint resolution = glGetUniformLocation(mProgram, "uResolution");
+    if (resolution >= 0) glUniform2f(resolution, static_cast<float>(width), static_cast<float>(height));
+    uniform1f(mProgram, "uTime", timeSeconds);
+    uniform1f(mProgram, "uMaxMip", maxMip);
+
+    uniform1i(mProgram, "uUseStatic", config.USE_STATIC ? 1 : 0);
+    uniform1f(mProgram, "uStaticStrength", config.STATIC_STRENGTH);
+    uniform1i(mProgram, "uUseLensDistortion", config.USE_LENS_DISTORTION ? 1 : 0);
+    uniform1f(mProgram, "uLensDistortionStrength", config.LENS_DISTORTION_STRENGTH);
+    uniform1i(mProgram, "uAspectRatio", config.ASPECT_RATIO ? 1 : 0);
+    uniform1i(mProgram, "uAutoExposure", config.AUTO_EXPOSURE ? 1 : 0);
+    uniform1f(mProgram, "uManualExposure", config.MANUAL_EXPOSURE);
+    uniform1i(mProgram, "uTonemapMethod", config.TONEMAPPING_METHOD);
+    uniform1i(mProgram, "uCompressionMethod", config.COMPRESSION_METHOD);
+    uniform1f(mProgram, "uLumaCompression", static_cast<float>(config.LUMA_COMPRESSION));
+    uniform1f(mProgram, "uChromaCompression", static_cast<float>(config.CHROMA_COMPRESSION));
+    uniform1f(mProgram, "uChromaBoost", config.CHROMA_BOOST);
+    uniform1f(mProgram, "uExtraZoom", config.EXTRA_ZOOM);
+    uniform1i(mProgram, "uUseSharpness", config.USE_SHARPNESS ? 1 : 0);
+    uniform1f(mProgram, "uSharpnessStrength", static_cast<float>(config.SHARPNESS_STRENGTH));
+    uniform1f(mProgram, "uSharpnessRadius", config.SHARPNESS_RADIUS);
+    uniform1i(mProgram, "uSideJitter", config.SIDE_JITTER ? 1 : 0);
+    uniform1f(mProgram, "uSideJitterAmount", config.SIDE_JITTER_AMMOUNT);
+
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    // Do not gate the pass on glGetError(): the game or another mod may have
+    // left a pending global GL error before this hook was entered.
+    return true;
 }
 
 bool PostProcessing::renderCurrentFrame() {
+    if (mRendering.test_and_set(std::memory_order_acquire)) return false;
+    struct ClearFlag { std::atomic_flag& flag; ~ClearFlag() { flag.clear(std::memory_order_release); } } clear{mRendering};
+
     ModConfig config;
     {
         std::lock_guard<std::mutex> lock(mConfigMutex);
         config = mConfig;
     }
-    if (!config.enabled || eglGetCurrentContext() == EGL_NO_CONTEXT)
+    if (!config.enabled || eglGetCurrentContext() == EGL_NO_CONTEXT) return false;
+
+    SavedGlState state;
+    state.capture();
+    auto restore = [&state]() { state.restore(); };
+
+    // This first implementation deliberately runs only on the final EGL surface.
+    // Internal game FBOs are skipped rather than accidentally post-processing them.
+    if (state.drawFramebuffer != 0 || state.readFramebuffer != 0 ||
+        state.viewport[0] != 0 || state.viewport[1] != 0 ||
+        state.viewport[2] <= 0 || state.viewport[3] <= 0 ||
+        state.viewport[2] > 8192 || state.viewport[3] > 8192) {
+        restore();
         return false;
-
-    if (!ensureGlResources(eglGetCurrentContext()))
-        return false;
-
-    GLint viewport[4]{};
-    GLint oldDrawFramebuffer = 0;
-    GLint oldReadFramebuffer = 0;
-    glGetIntegerv(GL_VIEWPORT, viewport);
-    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &oldDrawFramebuffer);
-    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &oldReadFramebuffer);
-
-    // At eglSwapBuffers the game's final image should be on the EGL surface.
-    // Skip non-default FBOs rather than accidentally post-process an internal pass.
-    if (oldDrawFramebuffer != 0 || oldReadFramebuffer != 0 || viewport[2] <= 0 || viewport[3] <= 0 || viewport[2] > 4096 || viewport[3] > 4096)
-        return false;
-
-    GLint oldProgram = 0;
-    GLint oldVao = 0;
-    GLint oldArrayBuffer = 0;
-    GLint oldActiveTexture = GL_TEXTURE0;
-    GLint oldTexture0 = 0;
-    GLint oldSampler0 = 0;
-    glGetIntegerv(GL_CURRENT_PROGRAM, &oldProgram);
-    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &oldVao);
-    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &oldArrayBuffer);
-    glGetIntegerv(GL_ACTIVE_TEXTURE, &oldActiveTexture);
-
-    const GLboolean blendWasEnabled = glIsEnabled(GL_BLEND);
-    const GLboolean depthWasEnabled = glIsEnabled(GL_DEPTH_TEST);
-    const GLboolean scissorWasEnabled = glIsEnabled(GL_SCISSOR_TEST);
-    const GLboolean cullWasEnabled = glIsEnabled(GL_CULL_FACE);
-    const GLboolean stencilWasEnabled = glIsEnabled(GL_STENCIL_TEST);
-    GLboolean oldColorMask[4] = {GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE};
-    glGetBooleanv(GL_COLOR_WRITEMASK, oldColorMask);
-
-    glActiveTexture(GL_TEXTURE0);
-    glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTexture0);
-    glGetIntegerv(GL_SAMPLER_BINDING, &oldSampler0);
-    glBindSampler(0, 0);
-    glBindTexture(GL_TEXTURE_2D, mSceneTexture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-    // Resolve the EGL surface into a normal 2D texture. Using blit instead of
-    // glCopyTexImage2D also handles multisampled default surfaces on GLES 3.
-    if (mTextureWidth != viewport[2] || mTextureHeight != viewport[3]) {
-        glBindTexture(GL_TEXTURE_2D, mSceneTexture);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, viewport[2], viewport[3], 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-        mTextureWidth = viewport[2];
-        mTextureHeight = viewport[3];
     }
 
+    const EGLContext context = eglGetCurrentContext();
+    if (mGlContext != context) {
+        // GL object names belong to the previous context. They must not be deleted
+        // while another context is current, so initialize fresh names instead.
+        mGlContext = context;
+        mProgram = mVertexArray = 0;
+        mCaptureTexture = mLensTexture = mToneTexture = mCompressionTexture = 0;
+        mCaptureFramebuffer = mWorkFramebuffer = 0;
+        mTextureWidth = mTextureHeight = 0;
+    }
+
+    if (!ensureProgram()) {
+        restore();
+        return false;
+    }
+    if (!mVertexArray) glGenVertexArrays(1, &mVertexArray);
+    if (!mVertexArray || !ensureTargets(state.viewport[2], state.viewport[3])) {
+        restore();
+        return false;
+    }
+
+    const int width = state.viewport[2];
+    const int height = state.viewport[3];
+    const float maxMip = std::floor(std::log2(static_cast<float>(std::max(width, height))));
+    const float timeSeconds = std::chrono::duration<float>(std::chrono::steady_clock::now() - kStartTime).count();
+
+    // Capture the already-composited display into a mipmapped texture.
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mResolveFramebuffer);
-    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                            GL_TEXTURE_2D, mSceneTexture, 0);
-    if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(oldDrawFramebuffer));
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(oldReadFramebuffer));
-        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(oldTexture0));
-        glBindSampler(0, static_cast<GLuint>(oldSampler0));
-        glActiveTexture(static_cast<GLenum>(oldActiveTexture));
-        mTextureWidth = 0;
-        mTextureHeight = 0;
-        return false;
-    }
-    glBlitFramebuffer(viewport[0], viewport[1], viewport[0] + viewport[2], viewport[1] + viewport[3],
-                      0, 0, viewport[2], viewport[3], GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mCaptureFramebuffer);
+    glBlitFramebuffer(state.viewport[0], state.viewport[1],
+                      state.viewport[0] + width, state.viewport[1] + height,
+                      0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindTexture(GL_TEXTURE_2D, mCaptureTexture);
     glGenerateMipmap(GL_TEXTURE_2D);
 
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     glDisable(GL_BLEND);
     glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_CULL_FACE);
-    glDisable(GL_STENCIL_TEST);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
-    glUseProgram(mProgram);
-    glBindVertexArray(mVertexArray);
-    glUniform1i(uniform(mProgram, "uScene"), 0);
-    glUniform2f(uniform(mProgram, "uResolution"), static_cast<float>(viewport[2]), static_cast<float>(viewport[3]));
+    // Separate targets preserve the original shader's pass/mipmap ordering:
+    // composite2 -> composite4 (bloom deferred) -> composite5 -> composite6.
+    if (!drawPass(mCaptureTexture, mWorkFramebuffer, mLensTexture, 0,
+                  width, height, config, timeSeconds, maxMip)) {
+        restore(); return false;
+    }
+    glBindTexture(GL_TEXTURE_2D, mLensTexture);
+    glGenerateMipmap(GL_TEXTURE_2D);
 
-    const auto now = std::chrono::steady_clock::now();
-    const float timeSeconds = std::chrono::duration<float>(now - kProcessStart).count();
-    setFloat(mProgram, "uTime", timeSeconds);
+    if (!drawPass(mLensTexture, mWorkFramebuffer, mToneTexture, 1,
+                  width, height, config, timeSeconds, maxMip)) {
+        restore(); return false;
+    }
+    glBindTexture(GL_TEXTURE_2D, mToneTexture);
+    glGenerateMipmap(GL_TEXTURE_2D);
 
-    setInt(mProgram, "uLensGroup", config.LENS_MODULE_ENABLED ? 1 : 0);
-    setInt(mProgram, "uCompressionGroup", config.COMPRESSION_MODULE_ENABLED ? 1 : 0);
-    setInt(mProgram, "uPostGroup", config.POSTPROCESSING_MODULE_ENABLED ? 1 : 0);
-    setInt(mProgram, "uSignalGroup", config.COMPRESSION_MODULE_ENABLED ? 1 : 0);
-    setInt(mProgram, "uUserSuggestionsGroup", config.USER_SUGGESTIONS_MODULE_ENABLED ? 1 : 0);
+    if (!drawPass(mToneTexture, mWorkFramebuffer, mCompressionTexture, 2,
+                  width, height, config, timeSeconds, maxMip)) {
+        restore(); return false;
+    }
+    glBindTexture(GL_TEXTURE_2D, mCompressionTexture);
+    glGenerateMipmap(GL_TEXTURE_2D);
 
-    setInt(mProgram, "uAspectRatio", config.ASPECT_RATIO ? 1 : 0);
-    setInt(mProgram, "uLensDistortion", config.USE_LENS_DISTORTION ? 1 : 0);
-    setFloat(mProgram, "uLensDistortionStrength", config.LENS_DISTORTION_STRENGTH);
-    setInt(mProgram, "uInterlacing", config.USE_INTERLACING ? 1 : 0);
-    setFloat(mProgram, "uInterlacingStrength", config.INTERLACING_STRENGTH);
-    setInt(mProgram, "uStaticNoise", config.USE_STATIC ? 1 : 0);
-    setFloat(mProgram, "uStaticStrength", config.STATIC_STRENGTH);
-    setInt(mProgram, "uMoreStatic", config.USE_MORE_STATIC ? 1 : 0);
-    setInt(mProgram, "uSideJitter", config.SIDE_JITTER ? 1 : 0);
-    setFloat(mProgram, "uSideJitterAmount", config.SIDE_JITTER_AMMOUNT);
-    setInt(mProgram, "uAutoExposure", config.AUTO_EXPOSURE ? 1 : 0);
-    setFloat(mProgram, "uManualExposure", config.MANUAL_EXPOSURE);
-    setInt(mProgram, "uTonemapMethod", config.TONEMAPPING_METHOD);
-    setFloat(mProgram, "uExtraZoom", config.EXTRA_ZOOM);
-    setInt(mProgram, "uSharpness", config.USE_SHARPNESS ? 1 : 0);
-    setFloat(mProgram, "uSharpnessStrength", static_cast<float>(config.SHARPNESS_STRENGTH));
-    setFloat(mProgram, "uSharpnessRadius", config.SHARPNESS_RADIUS);
-    setInt(mProgram, "uCompressionMethod", config.COMPRESSION_METHOD);
-    setFloat(mProgram, "uLumaCompression", static_cast<float>(config.LUMA_COMPRESSION));
-    setFloat(mProgram, "uChromaCompression", static_cast<float>(config.CHROMA_COMPRESSION));
-    setFloat(mProgram, "uChromaBoost", config.CHROMA_BOOST);
+    if (!drawPass(mCompressionTexture, 0, 0, 3,
+                  width, height, config, timeSeconds, maxMip)) {
+        restore(); return false;
+    }
 
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-
-    // Restore the state the game had when it called eglSwapBuffers.
-    glBindVertexArray(static_cast<GLuint>(oldVao));
-    glBindBuffer(GL_ARRAY_BUFFER, static_cast<GLuint>(oldArrayBuffer));
-    glUseProgram(static_cast<GLuint>(oldProgram));
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(oldDrawFramebuffer));
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(oldReadFramebuffer));
-    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(oldTexture0));
-    glBindSampler(0, static_cast<GLuint>(oldSampler0));
-    glActiveTexture(static_cast<GLenum>(oldActiveTexture));
-
-    if (blendWasEnabled) glEnable(GL_BLEND); else glDisable(GL_BLEND);
-    if (depthWasEnabled) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
-    if (scissorWasEnabled) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
-    if (cullWasEnabled) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
-    if (stencilWasEnabled) glEnable(GL_STENCIL_TEST); else glDisable(GL_STENCIL_TEST);
-    glColorMask(oldColorMask[0], oldColorMask[1], oldColorMask[2], oldColorMask[3]);
-
+    restore();
     return true;
 }
 

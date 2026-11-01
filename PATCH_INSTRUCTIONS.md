@@ -1,12 +1,11 @@
-# MC VHS PORT phase 1 patch
+# Applying MC VHS PORT rebuild 0.2.0
 
-This is an overlay patch for the existing `thinhtran2252/MC-VHS-PORT` repository.
+This is a source overlay, not an installable `.levipack`.
 
-1. Make a backup or commit your current working tree.
-2. Extract this archive directly into the repository root.
-3. Allow the listed files to be overwritten when prompted.
-4. Build with the repository's `scripts/package.ps1 -Abi arm64-v8a` command.
+1. Download `MC-VHS-PORT-rebuild-overlay-0.2.0.zip`.
+2. Extract it into the root of the `MC-VHS-PORT` repository.
+3. Allow the extracted files to replace files with matching paths.
+4. Commit the replacement as one rebuild commit.
+5. Run the Android build workflow or `./scripts/package.ps1 -Abi arm64-v8a` from a Windows/PowerShell build environment.
 
-The patch does not modify the Java source repository `mcvhs` and does not use LeviPostFX code.
-
-The first pass adds a GLES 3 screen-space post-processing pipeline and Java-style settings/configuration. Bloom, world-space lighting, fog, SSR, water and material passes are not part of this phase.
+The new CMake file pins Preloader Android to the same commit as the reference LeviPostFX project. The previous phase-one archive in the repository is not used by this source tree and can be removed separately after confirming the rebuild commit.

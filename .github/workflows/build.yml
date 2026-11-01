@@ -1,46 +1,37 @@
-name: MC VHS PORT Build
+name: MC VHS PORT Android Build
 
 on:
   push:
-    branches:
-      - main
-    tags:
-      - "v*"
+    branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
+        uses: android-actions/setup-android@v3
         with:
-          packages: |
-            platform-tools
+          packages: platform-tools
 
-      - name: Install Android build tools
-        run: |
-          sdkmanager "platforms;android-28" "ndk;28.2.13676358"
-          sudo apt-get update
-          sudo apt-get install -y ninja-build
+      - name: Install Android platform and NDK
+        run: sdkmanager "platforms;android-28" "ndk;28.2.13676358"
 
-      - name: Build packages
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Build arm64 package
         shell: pwsh
-        run: ./scripts/package.ps1 -Abi all
+        run: ./scripts/package.ps1 -Abi arm64-v8a
 
-      - name: Upload artifacts
+      - name: Upload package
         uses: actions/upload-artifact@v4
         with:
-          name: mc-vhs-port
-          path: build-*/*.levipack
-
-      - name: Publish release assets
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: build-*/*.levipack
+          name: mc-vhs-port-arm64
+          path: build-arm64-v8a/*.levipack
+          if-no-files-found: error
