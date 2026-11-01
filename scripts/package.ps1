@@ -28,11 +28,29 @@ function Resolve-NdkHome {
 
 function Invoke-ConfigGeneration {
     $configBuild = Join-Path $repoRoot "$BuildRoot-config"
-    & cmake -S $repoRoot -B $configBuild -G $Generator
-    if ($LASTEXITCODE -ne 0) { throw "Config CMake configure failed" }
-    & cmake --build $configBuild --target levi_generate_config
-    if ($LASTEXITCODE -ne 0) { throw "Config generation failed" }
-    return (Resolve-Path (Join-Path $configBuild "generated-config")).Path
+
+    & cmake -S $repoRoot -B $configBuild -G $Generator `
+        2>&1 | ForEach-Object { Write-Host $_ }
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Config CMake configure failed"
+    }
+
+    & cmake --build $configBuild --target levi_generate_config `
+        2>&1 | ForEach-Object { Write-Host $_ }
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Config generation failed"
+    }
+
+    $generated = Join-Path $configBuild "generated-config"
+
+    if (!(Test-Path (Join-Path $generated "config.json")) -or
+        !(Test-Path (Join-Path $generated "config.schema.json"))) {
+        throw "Generated config files are missing"
+    }
+
+    return ((Resolve-Path $generated).Path -replace "\\", "/")
 }
 
 function Invoke-ModBuild([string]$TargetAbi) {
