@@ -24,7 +24,7 @@ private:
     PostProcessing& operator=(const PostProcessing&) = delete;
 
     static EGLBoolean swapBuffersHook(EGLDisplay display, EGLSurface surface);
-    bool renderCurrentFrame();
+    bool renderCurrentFrame(EGLDisplay display, EGLSurface surface);
     bool ensureProgram();
     bool ensureTargets(int width, int height);
     bool allocateTargets(int width, int height, GLint internalFormat, GLenum type);
