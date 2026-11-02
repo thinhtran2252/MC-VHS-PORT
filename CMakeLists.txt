@@ -67,7 +67,8 @@ add_library(${MOD_LIBRARY_NAME} SHARED
     src/main.cpp
     src/mod/Config.cpp
     src/mod/MyMod.cpp
-    src/render/PostProcessing.cpp)
+    src/render/PostProcessing.cpp
+    src/render/Flashlight.cpp)
 set_target_properties(${MOD_LIBRARY_NAME} PROPERTIES OUTPUT_NAME "${MOD_LIBRARY_NAME}")
 target_include_directories(${MOD_LIBRARY_NAME} PRIVATE src "${LEVI_PRELOADER_INCLUDE_DIR}")
 target_compile_options(${MOD_LIBRARY_NAME} PRIVATE $<$<COMPILE_LANG_AND_ID:CXX,Clang,GNU>:-fvisibility=hidden -fvisibility-inlines-hidden>)
